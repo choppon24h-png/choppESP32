@@ -5,6 +5,7 @@
     #include <BLEServer.h>
     #include <BLEUtils.h>
     #include <BLE2902.h>
+    #include <BLESecurity.h>
 
     #include "operacional.h"
 
