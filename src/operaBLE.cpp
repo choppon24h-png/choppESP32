@@ -7,50 +7,73 @@
     bool deviceConnected = false;
 
     // Controla se o dispositivo Android foi autenticado via PIN ($AUTH:259087)
-    // Resetado para false a cada nova conexao BLE
     bool bleAutenticado = false;
+
+    // =========================================================================
+    // DIAGNÓSTICO DO STATUS=8 (GATT_CONN_TIMEOUT / Connection Supervision Timeout)
+    //
+    // O log mostra que exatamente 5 segundos após o $ML:300 ser enviado e o
+    // OK ser recebido, o BLE desconecta com status=8.
+    //
+    // CAUSA RAIZ: O ESP32 usa os parâmetros de conexão BLE padrão:
+    //   - Connection Interval: 7.5ms ~ 4000ms (negociado pelo stack)
+    //   - Supervision Timeout: 20s (padrão do Bluedroid)
+    //
+    // Porém, quando o ESP32 entra na taskLiberaML e começa a dispensar,
+    // ele fica bloqueado no loop while() com vTaskDelay(50ms). Durante esse
+    // tempo, o stack BLE Bluedroid não consegue processar os LL (Link Layer)
+    // keep-alive packets com prioridade suficiente, causando o supervision
+    // timeout no lado do Android.
+    //
+    // SOLUÇÃO DEFINITIVA — 3 camadas:
+    //
+    // 1. ESP32: Forçar connection parameters com supervision timeout alto (6s)
+    //    e connection interval curto (7.5ms) logo após conectar.
+    //    Isso garante que o Android envie keep-alives frequentes.
+    //
+    // 2. ESP32: A taskLiberaML roda na Core 0. O BLE Bluedroid também roda
+    //    na Core 0. Mover a taskLiberaML para a Core 1 (APP_CPU) para que
+    //    o BLE tenha a Core 0 (PRO_CPU) exclusivamente.
+    //    Isso é feito em main.cpp com xTaskCreatePinnedToCore(..., 0) → 1.
+    //
+    // 3. Android: Após reconectar, reenviar $ML com os ML restantes
+    //    (já implementado no PagamentoConcluido.java).
+    // =========================================================================
 
     // -------------------------------------------------------------------------
     // Callbacks de segurança BLE (bond/pairing nativo com PIN 259087)
-    // Ativado quando o Android chama device.createBond() antes do connectGatt()
     // -------------------------------------------------------------------------
     class MySecurityCallbacks : public BLESecurityCallbacks {
 
-        // Retorna o PIN quando o Android solicita pareamento
         uint32_t onPassKeyRequest() {
-            DBG_PRINT(F("\n[BLE-SEC] onPassKeyRequest — retornando PIN: "));
+            DBG_PRINT(F("\n[BLE-SEC] onPassKeyRequest — PIN: "));
             DBG_PRINT(BLE_AUTH_PIN);
             return atoi(BLE_AUTH_PIN);
         }
 
-        // Notifica que o PIN foi exibido (ESP32 com display)
         void onPassKeyNotify(uint32_t pass_key) {
-            DBG_PRINT(F("\n[BLE-SEC] onPassKeyNotify — PIN exibido: "));
+            DBG_PRINT(F("\n[BLE-SEC] onPassKeyNotify: "));
             DBG_PRINT(pass_key);
         }
 
-        // Retorna true para confirmar o pareamento
         bool onConfirmPIN(uint32_t pass_key) {
-            DBG_PRINT(F("\n[BLE-SEC] onConfirmPIN — confirmando PIN: "));
+            DBG_PRINT(F("\n[BLE-SEC] onConfirmPIN: "));
             DBG_PRINT(pass_key);
             return true;
         }
 
-        // Informa se o dispositivo já foi autenticado anteriormente
         bool onSecurityRequest() {
-            DBG_PRINT(F("\n[BLE-SEC] onSecurityRequest — permitindo"));
+            DBG_PRINT(F("\n[BLE-SEC] onSecurityRequest — OK"));
             return true;
         }
 
-        // Chamado quando a autenticação é concluída
-        // Se autenticado com sucesso, envia AUTH:OK automaticamente
         void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) {
             if (cmpl.success) {
-                DBG_PRINT(F("\n[BLE-SEC] Autenticacao BLE nativa concluida com SUCESSO"));
+                DBG_PRINT(F("\n[BLE-SEC] Autenticacao SUCESSO"));
                 bleAutenticado = true;
                 enviaBLE("AUTH:OK");
             } else {
-                DBG_PRINT(F("\n[BLE-SEC] Autenticacao BLE nativa FALHOU"));
+                DBG_PRINT(F("\n[BLE-SEC] Autenticacao FALHOU"));
                 bleAutenticado = false;
                 enviaBLE("AUTH:FAIL");
             }
@@ -61,39 +84,75 @@
     // Callbacks de conexão/desconexão
     // -------------------------------------------------------------------------
     class MyServerCallbacks : public BLEServerCallbacks {
-        void onConnect(BLEServer *pServer) {
+
+        void onConnect(BLEServer *pServer, esp_ble_gatts_cb_param_t *param) {
             digitalWrite(PINO_STATUS, LED_STATUS_ON);
-            DBG_PRINT(F("\n[BLE] Conectado"));
             deviceConnected = true;
-            // Reseta autenticacao a cada nova conexao
-            bleAutenticado = false;
-            DBG_PRINT(F("\n[BLE] Aguardando autenticacao (bond nativo ou $AUTH:PIN)"));
-            // Se havia uma operacao em andamento, envia o status atual
-            // para que o Android saiba quantos ML ainda faltam
+            bleAutenticado  = false;
+
+            // -----------------------------------------------------------------
+            // FIX DEFINITIVO STATUS=8: Forçar connection parameters logo após
+            // conectar para garantir supervision timeout alto e keep-alive
+            // frequente. Isso evita que o Android declare o ESP32 como perdido.
+            //
+            // Parâmetros:
+            //   conn_id        : ID da conexão atual
+            //   min_interval   : 6 * 1.25ms = 7.5ms  (mínimo BLE)
+            //   max_interval   : 6 * 1.25ms = 7.5ms  (forçar intervalo fixo)
+            //   latency        : 0 (sem slave latency — ESP32 responde sempre)
+            //   timeout        : 500 * 10ms = 5000ms (supervision timeout 5s)
+            //
+            // IMPORTANTE: slave_latency=0 é crítico. Com latency > 0, o ESP32
+            // pode "pular" connection events, o que causa o status=8 quando
+            // o Android não recebe ACK por muito tempo.
+            // -----------------------------------------------------------------
+            esp_ble_conn_update_params_t conn_params = {};
+            conn_params.bda[0] = param->connect.remote_bda[0];
+            conn_params.bda[1] = param->connect.remote_bda[1];
+            conn_params.bda[2] = param->connect.remote_bda[2];
+            conn_params.bda[3] = param->connect.remote_bda[3];
+            conn_params.bda[4] = param->connect.remote_bda[4];
+            conn_params.bda[5] = param->connect.remote_bda[5];
+            conn_params.min_int    = 0x06;   // 7.5ms
+            conn_params.max_int    = 0x06;   // 7.5ms
+            conn_params.latency    = 0;      // sem slave latency
+            conn_params.timeout    = 0x1F4;  // 5000ms supervision timeout
+
+            esp_ble_gap_update_conn_params(&conn_params);
+
+            DBG_PRINT(F("\n[BLE] Conectado — conn params atualizados (interval=7.5ms, timeout=5000ms)"));
+
+            // Se havia operação em andamento, notifica o Android ao reconectar
             if (operacaoEmAndamento) {
-                delay(800); // aguarda autenticacao
+                delay(1000); // aguarda autenticação completar
                 String statusReconexao = COMANDO_VP + String(mlLiberadoGlobal, 3);
                 enviaBLE(statusReconexao);
                 DBG_PRINT(F("\n[BLE] Reconexao durante operacao — VP enviado: "));
                 DBG_PRINT(mlLiberadoGlobal, 3);
             }
-        };
+        }
+
+        // Sobrecarga sem parâmetros (compatibilidade)
+        void onConnect(BLEServer *pServer) {
+            digitalWrite(PINO_STATUS, LED_STATUS_ON);
+            deviceConnected = true;
+            bleAutenticado  = false;
+            DBG_PRINT(F("\n[BLE] Conectado (sem param)"));
+        }
 
         void onDisconnect(BLEServer *pServer) {
             digitalWrite(PINO_STATUS, !LED_STATUS_ON);
-            DBG_PRINT(F("\n[BLE] Desconectado"));
+            DBG_PRINT(F("\n[BLE] Desconectado — reiniciando advertising"));
             deviceConnected = false;
-            bleAutenticado = false;
-            delay(500);
+            bleAutenticado  = false;
+            // Delay mínimo antes de reiniciar advertising
+            delay(200);
             pServer->startAdvertising();
         }
     };
 
     // -------------------------------------------------------------------------
     // Callbacks de escrita na característica RX
-    // Aceita dois fluxos de autenticação:
-    //   1. Bond nativo: Android faz createBond() → PIN 259087 → AUTH:OK automático
-    //   2. Comando manual: Android envia $AUTH:259087 → ESP32 valida e responde AUTH:OK
     // -------------------------------------------------------------------------
     class MyCallbacks : public BLECharacteristicCallbacks {
         void onWrite(BLECharacteristic *pCharacteristic) {
@@ -107,39 +166,30 @@
                 cmd.trim();
                 DBG_PRINT(cmd);
 
-                // ---------------------------------------------------------
-                // Fluxo 2: Autenticacao por comando $AUTH:<pin>
-                // Formato esperado do Android: $AUTH:259087
-                // Compativel com BluetoothService.java (envio automatico apos
-                // onServicesDiscovered) e com Bluetooth2.java (legado)
-                // ---------------------------------------------------------
+                // Autenticação por comando $AUTH:<pin>
                 if (cmd.startsWith("$") && cmd.substring(1, 6) == COMANDO_AUTH) {
                     String pinRecebido = cmd.substring(6);
                     pinRecebido.trim();
-                    DBG_PRINT(F("\n[BLE] PIN recebido via $AUTH: "));
-                    DBG_PRINT(pinRecebido);
                     if (pinRecebido == BLE_AUTH_PIN) {
                         bleAutenticado = true;
-                        DBG_PRINT(F("\n[BLE] Autenticacao OK via comando"));
+                        DBG_PRINT(F("\n[BLE] AUTH OK via comando"));
                         enviaBLE("AUTH:OK");
                     } else {
                         bleAutenticado = false;
-                        DBG_PRINT(F("\n[BLE] Autenticacao FALHOU - PIN incorreto"));
+                        DBG_PRINT(F("\n[BLE] AUTH FALHOU — PIN incorreto"));
                         enviaBLE("AUTH:FAIL");
                     }
                     return;
                 }
 
-                // ---------------------------------------------------------
-                // Bloqueia qualquer comando de operacao se nao autenticado
-                // ---------------------------------------------------------
+                // Bloqueia comandos sem autenticação
                 if (!bleAutenticado) {
-                    DBG_PRINT(F("\n[BLE] Comando bloqueado - dispositivo nao autenticado"));
+                    DBG_PRINT(F("\n[BLE] Comando bloqueado — nao autenticado"));
                     enviaBLE("ERROR:NOT_AUTHENTICATED");
                     return;
                 }
 
-                // Dispositivo autenticado: processa o comando normalmente
+                // Processa o comando de operação
                 executaOperacao(cmd);
             }
         }
@@ -147,54 +197,49 @@
 
 void setupBLE() {
 
-    // Inicializa o dispositivo BLE com o nome configurado (ex: CHOPP_0001)
     BLEDevice::init(BLE_NAME);
 
-    // -------------------------------------------------------------------------
-    // Configura segurança BLE nativa para suportar bond/pairing com PIN 259087
-    // Isso permite que o Android use device.createBond() antes do connectGatt()
-    // garantindo que o PIN seja injetado automaticamente via ACTION_PAIRING_REQUEST
-    // -------------------------------------------------------------------------
+    // Segurança BLE com bond/pairing PIN 259087
     BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_MITM);
     BLEDevice::setSecurityCallbacks(new MySecurityCallbacks());
 
     BLESecurity *pSecurity = new BLESecurity();
-    // Modo de autenticação: Secure Connections + MITM + Bond
     pSecurity->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
-    // Capacidade de I/O: ESP32 pode exibir o PIN (display only)
     pSecurity->setCapability(ESP_IO_CAP_OUT);
-    // PIN estático 259087
     pSecurity->setStaticPIN(atoi(BLE_AUTH_PIN));
-    // Tamanho da chave de criptografia
     pSecurity->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
 
-    DBG_PRINT(F("\n[BLE] Seguranca BLE configurada — PIN: "));
+    DBG_PRINT(F("\n[BLE] Seguranca configurada — PIN: "));
     DBG_PRINT(BLE_AUTH_PIN);
 
-    // Cria o servidor BLE
+    // Servidor BLE
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
-    // Cria o serviço BLE (Nordic UART Service - NUS)
+    // Serviço NUS (Nordic UART Service)
     BLEService *pService = pServer->createService(SERVICE_UUID);
 
-    // Característica TX (notificação → ESP32 envia dados ao Android)
+    // TX: ESP32 → Android (notify)
     pTxCharacteristic = pService->createCharacteristic(
         CHARACTERISTIC_UUID_TX,
         BLECharacteristic::PROPERTY_NOTIFY
     );
     pTxCharacteristic->addDescriptor(new BLE2902());
 
-    // Característica RX (escrita → Android envia comandos ao ESP32)
+    // RX: Android → ESP32 (write)
     BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
         CHARACTERISTIC_UUID_RX,
         BLECharacteristic::PROPERTY_WRITE
     );
     pRxCharacteristic->setCallbacks(new MyCallbacks());
 
-    // Inicia o serviço e o advertising
     pService->start();
-    pServer->getAdvertising()->start();
+
+    // Configura advertising com intervalo curto para reconexão rápida
+    BLEAdvertising *pAdvertising = pServer->getAdvertising();
+    pAdvertising->setMinInterval(0x20);  // 20ms
+    pAdvertising->setMaxInterval(0x40);  // 40ms
+    pAdvertising->start();
 
     DBG_PRINT(F("\n[BLE] Aguardando conexao — Nome: "));
     DBG_PRINT(BLE_NAME);

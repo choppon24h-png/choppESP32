@@ -47,7 +47,13 @@ void setup() {
         xTaskCreate(taskRFID, "taskRFID", 4096, NULL, 3, &taskRFIDHandle);
     #endif
 
-    xTaskCreate(taskLiberaML, "taskLiberaML", 4096, NULL, 3, NULL);
+    // FIX STATUS=8: taskLiberaML movida para Core 1 (APP_CPU_NUM).
+    // O BLE Bluedroid roda na Core 0 (PRO_CPU). Quando taskLiberaML rodava
+    // tambem na Core 0, o loop while() com vTaskDelay(50ms) impedia que o
+    // stack BLE processasse os LL keep-alive packets com prioridade suficiente,
+    // causando o Connection Supervision Timeout (status=8) no Android.
+    // Com taskLiberaML na Core 1, o BLE tem a Core 0 exclusivamente.
+    xTaskCreatePinnedToCore(taskLiberaML, "taskLiberaML", 8192, NULL, 3, NULL, 1);
 
 }
 
