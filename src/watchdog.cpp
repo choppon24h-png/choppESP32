@@ -9,6 +9,11 @@
 // Tempo máximo de espera por reconexão BLE durante dispensação (60s)
 #define WDG_BLE_RECONEXAO_TIMEOUT_MS  60000UL
 
+// [v2.1] PING Watchdog: se ESP ficar > 5s sem receber PING durante operação,
+// fecha a válvula. O timer é resetado por watchdog_kick() que é chamado
+// em handlePing() (command_parser.cpp) e em onWrite() (ble_protocol.cpp).
+// PROTO_WATCHDOG_MS = 5000ms (definido em protocol.h)
+
 // ── Inicialização ─────────────────────────────────────────────────────────
 void watchdog_init() {
     g_opState.ultimoComandoMs = (uint64_t)esp_timer_get_time() / 1000ULL;
@@ -61,12 +66,16 @@ void taskWatchdog(void* param) {
                 }
             }
 
-            // ── Caso 2: Watchdog de comando (5s sem comando com BLE ativo) ──
+            // ── Caso 2: PING Watchdog (5s sem PING/comando com BLE ativo) ──
+            // Qualquer dado recebido do Android (incluindo $PING) reseta o timer.
+            // Se o app travar ou perder comunicação, a válvula é fechada com segurança.
             uint64_t tempoSemComando = agora - g_opState.ultimoComandoMs;
             if (tempoSemComando >= PROTO_WATCHDOG_MS) {
-                DBG_PRINTF("[WDG] SEGURANÇA: %u ms sem comando com válvula aberta — fechando\n",
+                DBG_PRINTF("[WDG] PING WATCHDOG: %u ms sem PING/comando com válvula aberta — fechando\n",
                            (uint32_t)tempoSemComando);
-                valveController_stop("WDG_CMD_TIMEOUT");
+                DBG_PRINTLN("[WDG] TX: ERROR:WATCHDOG");
+                bleProtocol_send("ERROR:WATCHDOG");
+                valveController_stop("WDG_PING_TIMEOUT");
             }
 
         } else {

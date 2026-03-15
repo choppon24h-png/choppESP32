@@ -1,6 +1,8 @@
 #include "ble_protocol.h"
 #include "valve_controller.h"
 #include "watchdog.h"
+#include "command_history.h"   // [v2.1] Limpar histórico no disconnect
+#include "command_queue.h"     // [v2.1] Enfileirar via cmdQueue_enqueue
 #include <esp_gap_ble_api.h>
 #include <esp_bt_main.h>
 #include <esp_mac.h>
@@ -103,10 +105,20 @@ class MyServerCallbacks : public BLEServerCallbacks {
 
         DBG_PRINTLN("[BLE] Desconectado");
 
-        // Se válvula está aberta, NÃO fecha — watchdog cuidará se exceder 60s
-        if (valveController_isOpen()) {
-            DBG_PRINTLN("[BLE] Válvula permanece aberta — aguardando reconexão");
+        // [v2.1] PROTEÇÃO BLE DISCONNECT:
+        // Fecha a válvula IMEDIATAMENTE se não há operação em andamento.
+        // Se há operação (SYS_RUNNING), mantém aberta e aguarda reconexão.
+        if (valveController_isOpen() && g_opState.state != SYS_RUNNING) {
+            DBG_PRINTLN("[BLE] Disconnect sem operação ativa — fechando válvula imediatamente");
+            valveController_stop("BLE_DISCONNECT");
+        } else if (valveController_isOpen()) {
+            DBG_PRINTLN("[BLE] Disconnect durante operação — válvula permanece aberta (watchdog 60s)");
         }
+
+        // [v2.1] Limpa histórico de comandos e fila ao desconectar
+        // Evita falsos positivos de duplicação após reconexão
+        cmdHistory_clear();
+        cmdQueue_clear();
 
         // Reinicia advertising para permitir reconexão
         vTaskDelay(pdMS_TO_TICKS(200));
@@ -137,9 +149,10 @@ class MyRxCallbacks : public BLECharacteristicCallbacks {
 
         DBG_PRINTF("[PROTO] RX raw: [%s]\n", buf);
 
-        // Enfileira o comando para processamento (não bloqueia a ISR BLE)
-        if (xQueueSendFromISR(g_cmdQueue, buf, nullptr) != pdTRUE) {
-            DBG_PRINTLN("[BLE] ERRO: fila de comandos cheia — descartando");
+        // [v2.1] Enfileira via command_queue (FIFO 5, QUEUE:FULL automático)
+        // cmdQueue_enqueue já responde QUEUE:FULL se necessário
+        if (!cmdQueue_enqueue(buf)) {
+            DBG_PRINTF("[BLE] cmdQueue_enqueue falhou para: [%s]\n", buf);
         }
 
         // Reseta o watchdog a cada dado recebido

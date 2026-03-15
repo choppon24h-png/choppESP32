@@ -2,6 +2,12 @@
 #include "flow_sensor.h"
 #include "ble_protocol.h"
 
+// ── Timeout de operação (melhoria v2.1) ──────────────────────────────────
+// Se a dispensação não concluir em VALVE_OP_TIMEOUT_MS, fecha a válvula.
+// Protege contra sensor travado, pulsos não chegando ou loop infinito.
+#define VALVE_OP_TIMEOUT_MS     10000UL  // 10 segundos
+#define RESP_ERROR_TIMEOUT      "ERROR:TIMEOUT"
+
 // ═══════════════════════════════════════════════════════════════════════════
 // MÓDULO: valve_controller.cpp
 // ═══════════════════════════════════════════════════════════════════════════
@@ -99,7 +105,8 @@ void taskDispensacao(void* param) {
         // Abre a válvula e envia confirmação
         valveController_open();
 
-        uint64_t ultimoVP = (uint64_t)esp_timer_get_time() / 1000ULL;
+        uint64_t ultimoVP      = (uint64_t)esp_timer_get_time() / 1000ULL;
+        uint64_t inicioOperacao = (uint64_t)esp_timer_get_time() / 1000ULL; // [v2.1] Timeout 10s
 
         // ── Loop de dispensação ───────────────────────────────────────────
         while (g_opState.state == SYS_RUNNING) {
@@ -114,6 +121,15 @@ void taskDispensacao(void* param) {
             // ── Verifica se atingiu o volume alvo ─────────────────────────
             if (pulsos >= g_opState.pulsosAlvo) {
                 DBG_PRINTF("[DISP] Alvo atingido: %u pulsos | %u ml\n", pulsos, mlAtual);
+                break;
+            }
+
+            // ── [v2.1] Timeout de operação: 10s máximo ────────────────────
+            if ((agora - inicioOperacao) >= VALVE_OP_TIMEOUT_MS) {
+                DBG_PRINTF("[DISP] ERROR:TIMEOUT — operação excedeu %u ms — fechando válvula\n",
+                           VALVE_OP_TIMEOUT_MS);
+                bleProtocol_send(RESP_ERROR_TIMEOUT);
+                g_opState.state = SYS_ERROR;
                 break;
             }
 
